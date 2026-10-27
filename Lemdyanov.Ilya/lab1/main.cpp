@@ -7,22 +7,13 @@
 #include <filesystem>
 #include <iostream>
 #include <string>
+#include <sys/signalfd.h>
 #include <syslog.h>
-#include <system_error>
+#include <unistd.h>
 #include <utility>
+#include <vector>
 
 namespace {
-
-volatile std::sig_atomic_t termination_signal = 0;
-volatile std::sig_atomic_t reload_requested = 0;
-
-void handle_termination_signal(int signal_number) noexcept {
-    termination_signal = signal_number;
-}
-
-void handle_reload_signal(int) noexcept {
-    reload_requested = 1;
-}
 
 class SyslogSession {
 public:
@@ -38,30 +29,158 @@ public:
     SyslogSession& operator=(const SyslogSession&) = delete;
 };
 
-using SignalHandler = void (*)(int);
+class SignalSource {
+public:
+    SignalSource() = default;
 
-bool install_signal_handler(int signal_number,
-                            SignalHandler handler,
-                            const char* signal_name) {
-    struct sigaction action {};
-    action.sa_handler = handler;
-    action.sa_flags = 0;
+    ~SignalSource() {
+        if (descriptor_ >= 0) {
+            close(descriptor_);
+        }
+    }
 
-    if (sigemptyset(&action.sa_mask) == -1) {
+    SignalSource(const SignalSource&) = delete;
+    SignalSource& operator=(const SignalSource&) = delete;
+
+    bool initialize(std::string& error_message) {
+        sigset_t signal_mask{};
+        if (sigemptyset(&signal_mask) == -1) {
+            error_message = system_error_message("sigemptyset failed");
+            return false;
+        }
+        if (sigaddset(&signal_mask, SIGTERM) == -1 ||
+            sigaddset(&signal_mask, SIGINT) == -1 ||
+            sigaddset(&signal_mask, SIGHUP) == -1) {
+            error_message = system_error_message("sigaddset failed");
+            return false;
+        }
+
+        if (sigprocmask(SIG_BLOCK, &signal_mask, nullptr) == -1) {
+            error_message = system_error_message("sigprocmask failed");
+            return false;
+        }
+
+        descriptor_ = signalfd(-1, &signal_mask, SFD_CLOEXEC | SFD_NONBLOCK);
+        if (descriptor_ < 0) {
+            error_message = system_error_message("signalfd failed");
+            return false;
+        }
+        return true;
+    }
+
+    int descriptor() const noexcept {
+        return descriptor_;
+    }
+
+    bool consume(bool& reload_requested,
+                 int& termination_signal,
+                 std::string& error_message) const {
+        while (true) {
+            signalfd_siginfo signal_info{};
+            const ssize_t bytes_read = read(descriptor_, &signal_info, sizeof(signal_info));
+            if (bytes_read == static_cast<ssize_t>(sizeof(signal_info))) {
+                const int signal_number = static_cast<int>(signal_info.ssi_signo);
+                if (signal_number == SIGHUP) {
+                    reload_requested = true;
+                } else if (signal_number == SIGTERM || signal_number == SIGINT) {
+                    termination_signal = signal_number;
+                }
+                continue;
+            }
+
+            if (bytes_read < 0 && errno == EINTR) {
+                continue;
+            }
+            if (bytes_read < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+                return true;
+            }
+            if (bytes_read < 0) {
+                error_message = system_error_message("read from signalfd failed");
+            } else {
+                error_message = "Unexpected short read from signalfd";
+            }
+            return false;
+        }
+    }
+
+private:
+    int descriptor_ = -1;
+
+    static std::string system_error_message(const std::string& operation) {
         const int error_number = errno;
-        syslog(LOG_ERR, "Cannot initialize signal mask for %s: %s",
-               signal_name, std::strerror(error_number));
+        return operation + ": " + std::strerror(error_number);
+    }
+};
+
+class WorkingDirectoryGuard {
+public:
+    WorkingDirectoryGuard() = default;
+
+    ~WorkingDirectoryGuard() {
+        if (active_) {
+            std::error_code ignored_error;
+            std::filesystem::current_path(previous_directory_, ignored_error);
+        }
+    }
+
+    WorkingDirectoryGuard(const WorkingDirectoryGuard&) = delete;
+    WorkingDirectoryGuard& operator=(const WorkingDirectoryGuard&) = delete;
+
+    bool change_to(const std::filesystem::path& directory, std::string& error_message) {
+        std::error_code filesystem_error;
+        previous_directory_ = std::filesystem::current_path(filesystem_error);
+        if (filesystem_error) {
+            error_message = "Cannot determine current working directory: " +
+                            filesystem_error.message();
+            return false;
+        }
+
+        std::filesystem::current_path(directory, filesystem_error);
+        if (filesystem_error) {
+            error_message = "Cannot temporarily switch to configuration directory '" +
+                            directory.string() + "': " + filesystem_error.message();
+            return false;
+        }
+        active_ = true;
+        return true;
+    }
+
+    bool restore(std::string& error_message) {
+        if (!active_) {
+            return true;
+        }
+
+        std::error_code filesystem_error;
+        std::filesystem::current_path(previous_directory_, filesystem_error);
+        if (filesystem_error) {
+            error_message = "Cannot restore working directory: " +
+                            filesystem_error.message();
+            return false;
+        }
+        active_ = false;
+        return true;
+    }
+
+private:
+    std::filesystem::path previous_directory_;
+    bool active_ = false;
+};
+
+bool load_config_relative_to_file(const std::filesystem::path& absolute_config_path,
+                                  Config& config,
+                                  std::string& error_message) {
+    WorkingDirectoryGuard working_directory;
+    if (!working_directory.change_to(absolute_config_path.parent_path(), error_message)) {
         return false;
     }
 
-    if (sigaction(signal_number, &action, nullptr) == -1) {
-        const int error_number = errno;
-        syslog(LOG_ERR, "Cannot install %s handler: %s",
-               signal_name, std::strerror(error_number));
+    const bool loaded = config.load(absolute_config_path, error_message);
+    std::string restore_error;
+    if (!working_directory.restore(restore_error)) {
+        error_message = restore_error;
         return false;
     }
-
-    return true;
+    return loaded;
 }
 
 void log_started_directories(const Config& config) {
@@ -70,21 +189,62 @@ void log_started_directories(const Config& config) {
            config.directories().size() == 1U ? "y" : "ies");
 }
 
+bool resolve_monitor_paths(const Config& config,
+                           const std::filesystem::path& absolute_config_path,
+                           std::vector<std::filesystem::path>& directories,
+                           std::filesystem::path& event_log,
+                           std::string& error_message) {
+    namespace fs = std::filesystem;
+    const fs::path config_directory = absolute_config_path.parent_path();
+
+    const auto resolve = [&config_directory](const fs::path& path) {
+        if (path.is_absolute()) {
+            return path.lexically_normal();
+        }
+        return (config_directory / path).lexically_normal();
+    };
+
+    directories.clear();
+    directories.reserve(config.directories().size());
+    for (const auto& directory : config.directories()) {
+        if (directory.empty()) {
+            error_message = "An empty directory path was specified in the configuration";
+            return false;
+        }
+        directories.push_back(resolve(directory));
+    }
+
+    if (config.event_log().empty()) {
+        error_message = "An empty event-log path was specified in the configuration";
+        return false;
+    }
+    event_log = resolve(config.event_log());
+    return true;
+}
+
 void reload_configuration(const std::filesystem::path& absolute_config_path,
                           Config& active_config,
                           DirectoryMonitor& monitor) {
     Config candidate_config;
     std::string error_message;
-
-    if (!candidate_config.load(absolute_config_path, error_message)) {
-        syslog(LOG_ERR, "Configuration reload failed; keeping current configuration: %s",
+    if (!load_config_relative_to_file(absolute_config_path, candidate_config, error_message)) {
+        syslog(LOG_ERR,
+               "Configuration reload failed; keeping current configuration: %s",
                error_message.c_str());
         return;
     }
 
-    // DirectoryMonitor::start() prepares the replacement watches before it
-    // discards the current ones. If preparation fails, the old monitor remains active.
-    if (!monitor.start(candidate_config.directories(), candidate_config.event_log())) {
+    std::vector<std::filesystem::path> directories;
+    std::filesystem::path event_log;
+    if (!resolve_monitor_paths(candidate_config, absolute_config_path,
+                               directories, event_log, error_message)) {
+        syslog(LOG_ERR,
+               "Configuration reload failed; keeping current configuration: %s",
+               error_message.c_str());
+        return;
+    }
+
+    if (!monitor.start(directories, event_log)) {
         syslog(LOG_ERR,
                "Configuration reload could not be applied; keeping current configuration and watches");
         return;
@@ -109,18 +269,19 @@ int main(int argc, char* argv[]) {
         return 1;
     }
 
-    if (!install_signal_handler(SIGTERM, handle_termination_signal, "SIGTERM") ||
-        !install_signal_handler(SIGINT, handle_termination_signal, "SIGINT") ||
-        !install_signal_handler(SIGHUP, handle_reload_signal, "SIGHUP")) {
-        std::cerr << "Cannot install signal handlers; see system log\n";
+    SignalSource signal_source;
+    std::string error_message;
+    if (!signal_source.initialize(error_message)) {
+        std::cerr << "Cannot initialize signal handling: " << error_message << '\n';
+        syslog(LOG_ERR, "Cannot initialize signal handling: %s", error_message.c_str());
         return 1;
     }
 
-    const std::filesystem::path config_argument =
-        (argc == 2) ? argv[1] : "daemon.conf";
+    namespace fs = std::filesystem;
+    const fs::path config_argument = (argc == 2) ? argv[1] : "daemon.conf";
     std::error_code path_error;
-    const std::filesystem::path absolute_config_path =
-        std::filesystem::absolute(config_argument, path_error).lexically_normal();
+    const fs::path absolute_config_path =
+        fs::absolute(config_argument, path_error).lexically_normal();
     if (path_error) {
         std::cerr << "Cannot resolve configuration path: "
                   << path_error.message() << '\n';
@@ -130,17 +291,26 @@ int main(int argc, char* argv[]) {
     }
 
     Config config;
-    std::string error_message;
-    if (!config.load(absolute_config_path, error_message)) {
+    if (!load_config_relative_to_file(absolute_config_path, config, error_message)) {
         std::cerr << "Configuration error: " << error_message << '\n';
         syslog(LOG_ERR, "Configuration error: %s", error_message.c_str());
         syslog(LOG_NOTICE, "Disk Monitor startup aborted");
         return 1;
     }
 
+    std::vector<fs::path> directories;
+    fs::path event_log;
+    if (!resolve_monitor_paths(config, absolute_config_path,
+                               directories, event_log, error_message)) {
+        std::cerr << "Configuration path error: " << error_message << '\n';
+        syslog(LOG_ERR, "Configuration path error: %s", error_message.c_str());
+        syslog(LOG_NOTICE, "Disk Monitor startup aborted");
+        return 1;
+    }
+
     DirectoryMonitor monitor;
-    if (!monitor.start(config.directories(), config.event_log())) {
-        std::cerr << "Failed to start directory monitor; see error output and event log\n";
+    if (!monitor.start(directories, event_log)) {
+        std::cerr << "Failed to start directory monitor; see system log and event log\n";
         syslog(LOG_ERR, "Failed to start directory monitor");
         syslog(LOG_NOTICE, "Disk Monitor startup aborted");
         return 1;
@@ -148,25 +318,34 @@ int main(int argc, char* argv[]) {
 
     log_started_directories(config);
 
+    bool reload_requested = false;
+    int termination_signal = 0;
     while (termination_signal == 0) {
-        monitor.process_events(config.interval_seconds() * 1000);
+        if (reload_requested) {
+            // Clear before reloading. Signals arriving during the reload remain
+            // queued on signalfd and will wake the next poll immediately.
+            reload_requested = false;
+            syslog(LOG_INFO, "SIGHUP received; reloading configuration");
+            reload_configuration(absolute_config_path, config, monitor);
+            continue;
+        }
 
-        if (termination_signal != 0) {
+        if (!monitor.process_events(signal_source.descriptor())) {
+            syslog(LOG_ERR, "Disk Monitor stopped because of a monitoring error");
             break;
         }
 
-        if (reload_requested != 0) {
-            // Clear the flag before reloading. If another SIGHUP arrives while
-            // loading, its handler sets the flag again and it will be handled
-            // by the next iteration.
-            reload_requested = 0;
-            syslog(LOG_INFO, "SIGHUP received; reloading configuration");
-            reload_configuration(absolute_config_path, config, monitor);
+        if (!signal_source.consume(reload_requested, termination_signal, error_message)) {
+            syslog(LOG_ERR, "Cannot read signal descriptor: %s", error_message.c_str());
+            break;
         }
     }
 
     monitor.stop();
-    syslog(LOG_NOTICE, "Disk Monitor stopping after signal %d",
-           static_cast<int>(termination_signal));
-    return 0;
+    if (termination_signal != 0) {
+        syslog(LOG_NOTICE, "Disk Monitor stopping after signal %d", termination_signal);
+    } else {
+        syslog(LOG_NOTICE, "Disk Monitor stopping after an internal error");
+    }
+    return termination_signal == 0 ? 1 : 0;
 }

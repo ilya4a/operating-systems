@@ -1,4 +1,8 @@
 #include "Daemon.h"
+
+volatile std::sig_atomic_t Daemon::reload_requested_ = 0;
+volatile std::sig_atomic_t Daemon::stop_requested_ = 0;
+
 Daemon& Daemon::instance() {
     static Daemon daemon;
     return daemon;
