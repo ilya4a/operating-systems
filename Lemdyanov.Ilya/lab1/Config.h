@@ -4,14 +4,18 @@
 #include <string>
 #include <vector>
 
-struct Config {
-    int interval_seconds = 5;
-    std::vector<std::string> directories;
-    std::string event_log;
-    std::string pid_file;
-};
+class Config {
+public:
+    bool load(const std::filesystem::path& path, std::string& error_message);
 
-bool load_config(const std::filesystem::path& path,
-                 Config& config,
-                 std::string& error_message);
-std::string pid_file;
+    int interval_seconds() const noexcept;
+    const std::vector<std::filesystem::path>& directories() const noexcept;
+    const std::filesystem::path& event_log() const noexcept;
+    const std::filesystem::path& pid_file() const noexcept;
+
+private:
+    int interval_seconds_ = 5;
+    std::vector<std::filesystem::path> directories_;
+    std::filesystem::path event_log_;
+    std::filesystem::path pid_file_;
+};
