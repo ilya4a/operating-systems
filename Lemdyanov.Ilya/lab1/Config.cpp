@@ -7,40 +7,40 @@
 
 namespace {
 
-std::string trim(const std::string& value) {
-    const auto first = value.find_first_not_of(" \t\r\n");
-    if (first == std::string::npos) {
-        return {};
-    }
-
-    const auto last = value.find_last_not_of(" \t\r\n");
-    return value.substr(first, last - first + 1);
-}
-
-std::vector<std::string> split_directories(const std::string& value) {
-    std::vector<std::string> result;
-    std::size_t start = 0;
-
-    while (start <= value.size()) {
-        const auto separator = value.find(';', start);
-        const auto end = (separator == std::string::npos) ? value.size() : separator;
-        const auto item = trim(value.substr(start, end - start));
-        if (!item.empty()) {
-            result.push_back(item);
+    std::string trim(const std::string &value) {
+        const auto first = value.find_first_not_of(" \t\r\n");
+        if (first == std::string::npos) {
+            return {};
         }
 
-        if (separator == std::string::npos) {
-            break;
-        }
-        start = separator + 1;
+        const auto last = value.find_last_not_of(" \t\r\n");
+        return value.substr(first, last - first + 1);
     }
 
-    return result;
-}
+    std::vector<std::string> split_directories(const std::string &value) {
+        std::vector<std::string> result;
+        std::size_t start = 0;
+
+        while (start <= value.size()) {
+            const auto separator = value.find(';', start);
+            const auto end = (separator == std::string::npos) ? value.size() : separator;
+            const auto item = trim(value.substr(start, end - start));
+            if (!item.empty()) {
+                result.push_back(item);
+            }
+
+            if (separator == std::string::npos) {
+                break;
+            }
+            start = separator + 1;
+        }
+
+        return result;
+    }
 
 } // namespace
 
-bool Config::load(const std::filesystem::path& path, std::string& error_message) {
+bool Config::load(const std::filesystem::path &path, std::string &error_message) {
     namespace fs = std::filesystem;
 
     std::ifstream input(path);
@@ -89,11 +89,10 @@ bool Config::load(const std::filesystem::path& path, std::string& error_message)
 
         if (key == "interval_seconds") {
             int parsed_interval = 0;
-            const auto* begin = value.data();
-            const auto* end = begin + value.size();
+            const auto *begin = value.data();
+            const auto *end = begin + value.size();
             const auto result = std::from_chars(begin, end, parsed_interval);
-            if (result.ec != std::errc{} || result.ptr != end ||
-                parsed_interval <= 0 || parsed_interval > 86400) {
+            if (result.ec != std::errc {} || result.ptr != end || parsed_interval <= 0 || parsed_interval > 86400) {
                 error_message = "interval_seconds must be an integer from 1 to 86400";
                 return false;
             }
@@ -114,8 +113,7 @@ bool Config::load(const std::filesystem::path& path, std::string& error_message)
             }
             pid_file_value = value;
         } else {
-            error_message = "Unknown configuration key at line " + std::to_string(line_number) +
-                            ": " + key;
+            error_message = "Unknown configuration key at line " + std::to_string(line_number) + ": " + key;
             return false;
         }
     }
@@ -130,7 +128,7 @@ bool Config::load(const std::filesystem::path& path, std::string& error_message)
         return false;
     }
 
-    const auto resolve_path = [&base_directory](const std::string& value) {
+    const auto resolve_path = [&base_directory](const std::string &value) {
         fs::path result(value);
         if (result.is_relative()) {
             result = base_directory / result;
@@ -140,12 +138,11 @@ bool Config::load(const std::filesystem::path& path, std::string& error_message)
 
     std::vector<fs::path> directories;
     directories.reserve(directory_values.size());
-    for (const auto& directory_value : directory_values) {
+    for (const auto &directory_value : directory_values) {
         const auto directory = resolve_path(directory_value);
         std::error_code directory_error;
         if (!fs::is_directory(directory, directory_error)) {
-            error_message = "Not a directory or directory does not exist: " +
-                            directory.string();
+            error_message = "Not a directory or directory does not exist: " + directory.string();
             if (directory_error) {
                 error_message += " (" + directory_error.message() + ")";
             }
@@ -165,14 +162,14 @@ int Config::interval_seconds() const noexcept {
     return interval_seconds_;
 }
 
-const std::vector<std::filesystem::path>& Config::directories() const noexcept {
+const std::vector<std::filesystem::path> &Config::directories() const noexcept {
     return directories_;
 }
 
-const std::filesystem::path& Config::event_log() const noexcept {
+const std::filesystem::path &Config::event_log() const noexcept {
     return event_log_;
 }
 
-const std::filesystem::path& Config::pid_file() const noexcept {
+const std::filesystem::path &Config::pid_file() const noexcept {
     return pid_file_;
 }

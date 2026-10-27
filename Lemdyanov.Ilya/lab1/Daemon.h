@@ -6,27 +6,21 @@
 #include <vector>
 
 class Daemon final {
-public:
-    static Daemon& instance() noexcept;
+  public:
+    static Daemon &instance() noexcept;
 
-    Daemon(const Daemon&) = delete;
-    Daemon& operator=(const Daemon&) = delete;
-    Daemon(Daemon&&) = delete;
-    Daemon& operator=(Daemon&&) = delete;
+    Daemon(const Daemon &) = delete;
+    Daemon &operator=(const Daemon &) = delete;
+    Daemon(Daemon &&) = delete;
+    Daemon &operator=(Daemon &&) = delete;
 
-    // Forks, turns the child into a daemon, and makes the original parent exit.
-    // Additional descriptors are preserved in the daemon (for example signalfd).
-    // Returns in the daemon child; the original parent exits with the startup status.
     bool daemonize();
-    bool daemonize(const std::vector<int>& additional_descriptors_to_keep);
+    bool daemonize(const std::vector<int> &additional_descriptors_to_keep);
 
-    // Locks a stable sidecar file (<pid-path>.lock), then creates/updates the
-    // PID file. The lock is inherited over fork() and the child PID is written
-    // before daemonize() lets the parent exit.
-    bool prepare_pid_file(const std::string& path);
+    bool prepare_pid_file(const std::string &path);
     void release_pid_file() noexcept;
 
-private:
+  private:
     Daemon() = default;
     ~Daemon();
 
