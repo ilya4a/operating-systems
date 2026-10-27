@@ -3,6 +3,7 @@
 #include <array>
 #include <cerrno>
 #include <chrono>
+#include <cstdint>
 #include <ctime>
 #include <cstring>
 #include <iomanip>
@@ -11,6 +12,7 @@
 #include <sstream>
 #include <sys/inotify.h>
 #include <unistd.h>
+#include <utility>
 #include <vector>
 
 namespace {
@@ -64,63 +66,68 @@ DirectoryMonitor::~DirectoryMonitor() {
 bool DirectoryMonitor::start(const std::vector<std::filesystem::path>& directories,
                              const std::filesystem::path& event_log) {
     namespace fs = std::filesystem;
-    stop();
 
     std::error_code filesystem_error;
-    event_log_path_ = fs::absolute(event_log, filesystem_error).lexically_normal();
+    const fs::path new_event_log_path =
+        fs::absolute(event_log, filesystem_error).lexically_normal();
     if (filesystem_error) {
-        std::cerr << "Cannot resolve event-log path '" << event_log << "': "
-                  << filesystem_error.message() << '\n';
-        return false;
-    }
-
-    event_log_stream_.open(event_log_path_, std::ios::out | std::ios::app);
-    if (!event_log_stream_.is_open()) {
-        std::cerr << "Cannot open event log '" << event_log_path_ << "'\n";
-        return false;
-    }
-
-    const auto cleanup_failed_start = [this]() {
-        if (inotify_fd_ >= 0) {
-            close(inotify_fd_);
-            inotify_fd_ = -1;
-        }
-        watch_paths_.clear();
+        const auto message = "Cannot resolve event-log path '" + event_log.string() +
+                             "': " + filesystem_error.message();
+        std::cerr << message << '\n';
         if (event_log_stream_.is_open()) {
-            event_log_stream_.close();
+            write_log("ERROR " + message);
+        }
+        return false;
+    }
+
+    std::ofstream new_event_log_stream;
+    new_event_log_stream.open(new_event_log_path, std::ios::out | std::ios::app);
+    if (!new_event_log_stream.is_open()) {
+        const auto message = "Cannot open event log '" + new_event_log_path.string() + "'";
+        std::cerr << message << '\n';
+        if (event_log_stream_.is_open()) {
+            write_log("ERROR " + message);
+        }
+        return false;
+    }
+
+    const auto report_error = [this](const std::string& message) {
+        std::cerr << message << '\n';
+        if (event_log_stream_.is_open()) {
+            write_log("ERROR " + message);
         }
     };
 
-    inotify_fd_ = inotify_init1(IN_CLOEXEC | IN_NONBLOCK);
-    if (inotify_fd_ < 0) {
-        const auto message = system_error_message("inotify_init1 failed");
-        std::cerr << message << '\n';
-        write_log("ERROR " + message);
-        cleanup_failed_start();
+    const int new_inotify_fd = inotify_init1(IN_CLOEXEC | IN_NONBLOCK);
+    if (new_inotify_fd < 0) {
+        report_error(system_error_message("inotify_init1 failed"));
         return false;
     }
+
+    const auto cleanup_new_monitor = [&new_inotify_fd]() {
+        close(new_inotify_fd);
+    };
 
     constexpr std::uint32_t watch_mask = IN_ACCESS | IN_ATTRIB | IN_CLOSE_WRITE |
         IN_CLOSE_NOWRITE | IN_CREATE | IN_DELETE | IN_DELETE_SELF | IN_MODIFY |
         IN_MOVE_SELF | IN_MOVED_FROM | IN_MOVED_TO | IN_OPEN | IN_ONLYDIR;
 
     if (directories.empty()) {
-        const std::string message = "No directories were provided to DirectoryMonitor";
-        std::cerr << message << '\n';
-        write_log("ERROR " + message);
-        cleanup_failed_start();
+        report_error("No directories were provided to DirectoryMonitor");
+        cleanup_new_monitor();
         return false;
     }
 
+    std::unordered_map<int, fs::path> new_watch_paths;
     for (const auto& directory_value : directories) {
         filesystem_error.clear();
-        const auto directory = fs::absolute(directory_value, filesystem_error).lexically_normal();
+        const fs::path directory =
+            fs::absolute(directory_value, filesystem_error).lexically_normal();
         if (filesystem_error) {
             const auto message = "Cannot resolve directory '" + directory_value.string() +
                                  "': " + filesystem_error.message();
-            std::cerr << message << '\n';
-            write_log("ERROR " + message);
-            cleanup_failed_start();
+            report_error(message);
+            cleanup_new_monitor();
             return false;
         }
 
@@ -131,25 +138,38 @@ bool DirectoryMonitor::start(const std::vector<std::filesystem::path>& directori
             if (filesystem_error) {
                 message += " (" + filesystem_error.message() + ")";
             }
-            std::cerr << message << '\n';
-            write_log("ERROR " + message);
-            cleanup_failed_start();
+            report_error(message);
+            cleanup_new_monitor();
             return false;
         }
 
-        const int watch_descriptor = inotify_add_watch(
-            inotify_fd_, directory.c_str(), watch_mask);
+        const int watch_descriptor =
+            inotify_add_watch(new_inotify_fd, directory.c_str(), watch_mask);
         if (watch_descriptor < 0) {
             const auto message = system_error_message(
                 "Cannot watch directory '" + directory.string() + "'");
-            std::cerr << message << '\n';
-            write_log("ERROR " + message);
-            cleanup_failed_start();
+            report_error(message);
+            cleanup_new_monitor();
             return false;
         }
 
-        watch_paths_[watch_descriptor] = directory;
+        new_watch_paths[watch_descriptor] = directory;
     }
+
+    if (inotify_fd_ >= 0) {
+        write_log("MONITOR_RECONFIGURING");
+        close(inotify_fd_);
+        inotify_fd_ = -1;
+    }
+    watch_paths_.clear();
+    if (event_log_stream_.is_open()) {
+        event_log_stream_.close();
+    }
+
+    inotify_fd_ = new_inotify_fd;
+    watch_paths_ = std::move(new_watch_paths);
+    event_log_path_ = new_event_log_path;
+    event_log_stream_ = std::move(new_event_log_stream);
 
     write_log("MONITOR_STARTED");
     return true;

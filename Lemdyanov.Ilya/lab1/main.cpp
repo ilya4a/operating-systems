@@ -4,16 +4,24 @@
 #include <cerrno>
 #include <csignal>
 #include <cstring>
+#include <filesystem>
 #include <iostream>
+#include <string>
 #include <syslog.h>
-#include <unistd.h>
+#include <system_error>
+#include <utility>
 
 namespace {
 
 volatile std::sig_atomic_t termination_signal = 0;
+volatile std::sig_atomic_t reload_requested = 0;
 
 void handle_termination_signal(int signal_number) noexcept {
     termination_signal = signal_number;
+}
+
+void handle_reload_signal(int) noexcept {
+    reload_requested = 1;
 }
 
 class SyslogSession {
@@ -30,9 +38,13 @@ public:
     SyslogSession& operator=(const SyslogSession&) = delete;
 };
 
-bool install_termination_handler(int signal_number, const char* signal_name) {
+using SignalHandler = void (*)(int);
+
+bool install_signal_handler(int signal_number,
+                            SignalHandler handler,
+                            const char* signal_name) {
     struct sigaction action {};
-    action.sa_handler = handle_termination_signal;
+    action.sa_handler = handler;
     action.sa_flags = 0;
 
     if (sigemptyset(&action.sa_mask) == -1) {
@@ -52,6 +64,38 @@ bool install_termination_handler(int signal_number, const char* signal_name) {
     return true;
 }
 
+void log_started_directories(const Config& config) {
+    syslog(LOG_INFO, "Disk Monitor started successfully; watching %zu director%s",
+           config.directories().size(),
+           config.directories().size() == 1U ? "y" : "ies");
+}
+
+void reload_configuration(const std::filesystem::path& absolute_config_path,
+                          Config& active_config,
+                          DirectoryMonitor& monitor) {
+    Config candidate_config;
+    std::string error_message;
+
+    if (!candidate_config.load(absolute_config_path, error_message)) {
+        syslog(LOG_ERR, "Configuration reload failed; keeping current configuration: %s",
+               error_message.c_str());
+        return;
+    }
+
+    // DirectoryMonitor::start() prepares the replacement watches before it
+    // discards the current ones. If preparation fails, the old monitor remains active.
+    if (!monitor.start(candidate_config.directories(), candidate_config.event_log())) {
+        syslog(LOG_ERR,
+               "Configuration reload could not be applied; keeping current configuration and watches");
+        return;
+    }
+
+    active_config = std::move(candidate_config);
+    syslog(LOG_INFO, "Configuration reloaded successfully from %s",
+           absolute_config_path.c_str());
+    log_started_directories(active_config);
+}
+
 } // namespace
 
 int main(int argc, char* argv[]) {
@@ -65,18 +109,31 @@ int main(int argc, char* argv[]) {
         return 1;
     }
 
-    if (!install_termination_handler(SIGTERM, "SIGTERM") ||
-        !install_termination_handler(SIGINT, "SIGINT")) {
-        std::cerr << "Cannot install termination signal handlers; see system log\n";
+    if (!install_signal_handler(SIGTERM, handle_termination_signal, "SIGTERM") ||
+        !install_signal_handler(SIGINT, handle_termination_signal, "SIGINT") ||
+        !install_signal_handler(SIGHUP, handle_reload_signal, "SIGHUP")) {
+        std::cerr << "Cannot install signal handlers; see system log\n";
         return 1;
     }
 
-    const std::filesystem::path config_path = (argc == 2) ? argv[1] : "daemon.conf";
+    const std::filesystem::path config_argument =
+        (argc == 2) ? argv[1] : "daemon.conf";
+    std::error_code path_error;
+    const std::filesystem::path absolute_config_path =
+        std::filesystem::absolute(config_argument, path_error).lexically_normal();
+    if (path_error) {
+        std::cerr << "Cannot resolve configuration path: "
+                  << path_error.message() << '\n';
+        syslog(LOG_ERR, "Cannot resolve configuration path '%s': %s",
+               config_argument.c_str(), path_error.message().c_str());
+        return 1;
+    }
+
     Config config;
-    std::string error;
-    if (!config.load(config_path, error)) {
-        std::cerr << "Configuration error: " << error << '\n';
-        syslog(LOG_ERR, "Configuration error: %s", error.c_str());
+    std::string error_message;
+    if (!config.load(absolute_config_path, error_message)) {
+        std::cerr << "Configuration error: " << error_message << '\n';
+        syslog(LOG_ERR, "Configuration error: %s", error_message.c_str());
         syslog(LOG_NOTICE, "Disk Monitor startup aborted");
         return 1;
     }
@@ -89,12 +146,23 @@ int main(int argc, char* argv[]) {
         return 1;
     }
 
-    syslog(LOG_INFO, "Disk Monitor started successfully; watching %zu director%s",
-           config.directories().size(),
-           config.directories().size() == 1U ? "y" : "ies");
+    log_started_directories(config);
 
     while (termination_signal == 0) {
         monitor.process_events(config.interval_seconds() * 1000);
+
+        if (termination_signal != 0) {
+            break;
+        }
+
+        if (reload_requested != 0) {
+            // Clear the flag before reloading. If another SIGHUP arrives while
+            // loading, its handler sets the flag again and it will be handled
+            // by the next iteration.
+            reload_requested = 0;
+            syslog(LOG_INFO, "SIGHUP received; reloading configuration");
+            reload_configuration(absolute_config_path, config, monitor);
+        }
     }
 
     monitor.stop();
