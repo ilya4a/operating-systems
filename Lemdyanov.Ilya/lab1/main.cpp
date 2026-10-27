@@ -1,6 +1,6 @@
-#include "Config.h"
 #include "Daemon.h"
-#include "DirectoryMonitor.h"
+#include "include/Config.h"
+#include "include/DirectoryMonitor.h"
 
 #include <cerrno>
 #include <csignal>
