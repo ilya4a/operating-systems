@@ -28,7 +28,6 @@ cmake --build cmake-build-debug
 mkdir -p runtime/watch runtime/logs runtime/run
 
 cat > runtime/daemon.conf <<'EOF'
-interval_seconds=5
 directories=./watch
 event_log=./logs/events.log
 pid_file=./run/disk-monitor.pid
@@ -65,7 +64,6 @@ kill -TERM "$(cat runtime/run/disk-monitor.pid)"
 - `directories` — обязательный список существующих каталогов для наблюдения; несколько путей разделяются символом `;`.
 - `event_log` — путь к журналу файловых событий. По умолчанию `disk-monitor.log`.
 - `pid_file` — путь к PID-файлу. По умолчанию `disk-monitor.pid`.
-- `interval_seconds` — целое число от `1` до `86400`, по умолчанию `5`. Параметр проверяется при чтении конфигурации, но обнаружение событий выполняется через `inotify`, а не по таймеру.
 
 Относительные пути отсчитываются от каталога, в котором находится конфигурационный файл. Поэтому в приведённом примере наблюдается каталог `runtime/watch`, журнал записывается в `runtime/logs/events.log`, а PID-файл создаётся в `runtime/run/`.
 

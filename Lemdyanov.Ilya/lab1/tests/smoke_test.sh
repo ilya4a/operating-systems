@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # Smoke/integration tests for the Linux inotify Disk Monitor.
 # The configuration template must use the application's real syntax and contain
-# exactly one @WATCH_DIR@ token and exactly one @EVENT_LOG@ token. Keep all
-# other required keys (including interval_seconds if Config still requires it).
+# exactly one @WATCH_DIR@ token and exactly one @EVENT_LOG@ token. The obsolete
+# interval_seconds key must not be present.
 
 set -Eeuo pipefail
 
@@ -34,7 +34,9 @@ info() { printf 'INFO: %s\n' "$*"; }
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
 ROOT="$SCRIPT_DIR"
-if [[ ! -f "$ROOT/main.cpp" && -f "$ROOT/../main.cpp" ]]; then
+if [[ ! -f "$ROOT/main.cpp" && -f "$ROOT/../src/main.cpp" ]]; then
+    ROOT="$(cd -- "$ROOT/.." && pwd -P)"
+elif [[ ! -f "$ROOT/main.cpp" && -f "$ROOT/../main.cpp" ]]; then
     ROOT="$(cd -- "$ROOT/.." && pwd -P)"
 fi
 
@@ -109,21 +111,31 @@ trap cleanup EXIT INT TERM HUP
 
 if [[ "$DO_BUILD" -eq 1 ]]; then
     command -v g++ >/dev/null 2>&1 || fail "g++ not found"
-    [[ -f "$ROOT/main.cpp" ]] || fail "main.cpp not found under $ROOT"
-    [[ -f "$ROOT/DirectoryMonitor.cpp" ]] || fail "DirectoryMonitor.cpp not found under $ROOT"
-    [[ -f "$ROOT/Daemon.cpp" ]] || fail "Daemon.cpp not found under $ROOT"
+
+    # Support both the current src/ + include/ layout and the older flat layout.
+    if [[ -f "$ROOT/src/main.cpp" ]]; then
+        SOURCE_DIR="$ROOT/src"
+        INCLUDE_DIR="$ROOT/include"
+    else
+        SOURCE_DIR="$ROOT"
+        INCLUDE_DIR="$ROOT"
+    fi
+
+    [[ -f "$SOURCE_DIR/main.cpp" ]] || fail "main.cpp not found under $SOURCE_DIR"
+    [[ -f "$SOURCE_DIR/DirectoryMonitor.cpp" ]] || fail "DirectoryMonitor.cpp not found under $SOURCE_DIR"
+    [[ -f "$SOURCE_DIR/Daemon.cpp" ]] || fail "Daemon.cpp not found under $SOURCE_DIR"
 
     config_source=""
-    for candidate in "$ROOT/Config.cpp" "$ROOT/config.cpp"; do
+    for candidate in "$SOURCE_DIR/Config.cpp" "$SOURCE_DIR/config.cpp"; do
         if [[ -f "$candidate" ]]; then config_source="$candidate"; break; fi
     done
-    [[ -n "$config_source" ]] || fail "Config.cpp/config.cpp not found under $ROOT"
+    [[ -n "$config_source" ]] || fail "Config.cpp/config.cpp not found under $SOURCE_DIR"
 
     build_dir="$TMP_ROOT/build"
     mkdir -p "$build_dir"
-    sources=("$ROOT/main.cpp" "$config_source" "$ROOT/DirectoryMonitor.cpp" "$ROOT/Daemon.cpp")
+    sources=("$SOURCE_DIR/main.cpp" "$config_source" "$SOURCE_DIR/DirectoryMonitor.cpp" "$SOURCE_DIR/Daemon.cpp")
     info "Building with -std=c++17 -Wall -Wextra -Wpedantic -Werror"
-    g++ -std=c++17 -Wall -Wextra -Wpedantic -Werror -I"$ROOT" \
+    g++ -std=c++17 -Wall -Wextra -Wpedantic -Werror -I"$INCLUDE_DIR" \
         "${sources[@]}" -o "$build_dir/disk-monitor" || fail "strict compilation failed"
     BINARY="$build_dir/disk-monitor"
 else
@@ -152,6 +164,14 @@ for token in ("@WATCH_DIR@", "@EVENT_LOG@"):
     count = text.count(token)
     if count != 1:
         print(f"FAIL: {p} must contain {token} exactly once (found {count})", file=sys.stderr)
+        sys.exit(1)
+for line_number, line in enumerate(text.splitlines(), start=1):
+    stripped = line.strip()
+    if not stripped or stripped.startswith("#") or "=" not in stripped:
+        continue
+    key = stripped.split("=", 1)[0].strip()
+    if key == "interval_seconds":
+        print(f"FAIL: obsolete key interval_seconds must not appear in {p} (line {line_number})", file=sys.stderr)
         sys.exit(1)
 PY
 

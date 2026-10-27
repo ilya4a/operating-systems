@@ -1,4 +1,3 @@
-interval_seconds=5
 directories=@WATCH_DIR@
 event_log=@EVENT_LOG@
 pid_file=./disk-monitor.pid

@@ -59,7 +59,6 @@ bool Config::load(const std::filesystem::path &path, std::string &error_message)
         }
     }
 
-    int interval_seconds = 5;
     std::vector<std::string> directory_values;
     std::string event_log_value = "disk-monitor.log";
     std::string pid_file_value = "disk-monitor.pid";
@@ -87,17 +86,7 @@ bool Config::load(const std::filesystem::path &path, std::string &error_message)
             return false;
         }
 
-        if (key == "interval_seconds") {
-            int parsed_interval = 0;
-            const auto *begin = value.data();
-            const auto *end = begin + value.size();
-            const auto result = std::from_chars(begin, end, parsed_interval);
-            if (result.ec != std::errc {} || result.ptr != end || parsed_interval <= 0 || parsed_interval > 86400) {
-                error_message = "interval_seconds must be an integer from 1 to 86400";
-                return false;
-            }
-            interval_seconds = parsed_interval;
-        } else if (key == "directories") {
+        if (key == "directories") {
             directory_values = split_directories(value);
             directories_were_set = true;
         } else if (key == "event_log") {
@@ -151,16 +140,12 @@ bool Config::load(const std::filesystem::path &path, std::string &error_message)
         directories.push_back(directory);
     }
 
-    interval_seconds_ = interval_seconds;
     directories_ = std::move(directories);
     event_log_ = resolve_path(event_log_value);
     pid_file_ = resolve_path(pid_file_value);
     return true;
 }
 
-int Config::interval_seconds() const noexcept {
-    return interval_seconds_;
-}
 
 const std::vector<std::filesystem::path> &Config::directories() const noexcept {
     return directories_;
