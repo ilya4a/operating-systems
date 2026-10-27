@@ -3,8 +3,8 @@
 #include <array>
 #include <cerrno>
 #include <chrono>
-#include <cstring>
 #include <ctime>
+#include <cstring>
 #include <iomanip>
 #include <iostream>
 #include <poll.h>
@@ -12,13 +12,6 @@
 #include <sys/inotify.h>
 #include <unistd.h>
 #include <vector>
-
-#include "Daemon.h"
-
-
-volatile std::sig_atomic_t Daemon::reload_requested_ = 0;
-volatile std::sig_atomic_t Daemon::stop_requested_ = 0;
-
 
 namespace {
 
@@ -38,25 +31,28 @@ std::string describe_event(std::uint32_t mask) {
     if ((mask & IN_MOVED_TO) != 0U) names.emplace_back("MOVED_TO");
     if ((mask & IN_OPEN) != 0U) names.emplace_back("OPEN");
     if ((mask & IN_IGNORED) != 0U) names.emplace_back("IGNORED");
-    if ((mask & IN_Q_OVERFLOW) != 0U) names.emplace_back("QUEUE_OVERFLOW");
     if ((mask & IN_UNMOUNT) != 0U) names.emplace_back("UNMOUNT");
+    if ((mask & IN_Q_OVERFLOW) != 0U) names.emplace_back("QUEUE_OVERFLOW");
 
     if (names.empty()) {
-        return "UNKNOWN_EVENT";
+        names.emplace_back("UNKNOWN_EVENT");
     }
 
     std::ostringstream result;
-    for (std::size_t i = 0; i < names.size(); ++i) {
-        if (i != 0U) {
+    for (std::size_t index = 0U; index < names.size(); ++index) {
+        if (index != 0U) {
             result << '|';
         }
-        result << names[i];
+        result << names[index];
     }
-
     if ((mask & IN_ISDIR) != 0U) {
         result << "|IS_DIR";
     }
     return result.str();
+}
+
+std::string system_error_message(const std::string& operation) {
+    return operation + ": " + std::strerror(errno);
 }
 
 } // namespace
@@ -66,38 +62,93 @@ DirectoryMonitor::~DirectoryMonitor() {
 }
 
 bool DirectoryMonitor::start(const std::vector<std::filesystem::path>& directories,
-                              const std::filesystem::path& event_log) {
+                             const std::filesystem::path& event_log) {
+    namespace fs = std::filesystem;
     stop();
 
-    event_log_path_ = event_log.lexically_normal();
-    event_log_stream_.open(event_log_path_, std::ios::out | std::ios::app);
-    if (!event_log_stream_) {
-        std::cerr << "Cannot open event log: " << event_log_path_ << '\n';
+    std::error_code filesystem_error;
+    event_log_path_ = fs::absolute(event_log, filesystem_error).lexically_normal();
+    if (filesystem_error) {
+        std::cerr << "Cannot resolve event-log path '" << event_log << "': "
+                  << filesystem_error.message() << '\n';
         return false;
     }
 
+    event_log_stream_.open(event_log_path_, std::ios::out | std::ios::app);
+    if (!event_log_stream_.is_open()) {
+        std::cerr << "Cannot open event log '" << event_log_path_ << "'\n";
+        return false;
+    }
+
+    const auto cleanup_failed_start = [this]() {
+        if (inotify_fd_ >= 0) {
+            close(inotify_fd_);
+            inotify_fd_ = -1;
+        }
+        watch_paths_.clear();
+        if (event_log_stream_.is_open()) {
+            event_log_stream_.close();
+        }
+    };
+
     inotify_fd_ = inotify_init1(IN_CLOEXEC | IN_NONBLOCK);
     if (inotify_fd_ < 0) {
-        std::cerr << "inotify_init1 failed: " << std::strerror(errno) << '\n';
-        stop();
+        const auto message = system_error_message("inotify_init1 failed");
+        std::cerr << message << '\n';
+        write_log("ERROR " + message);
+        cleanup_failed_start();
         return false;
     }
 
     constexpr std::uint32_t watch_mask = IN_ACCESS | IN_ATTRIB | IN_CLOSE_WRITE |
         IN_CLOSE_NOWRITE | IN_CREATE | IN_DELETE | IN_DELETE_SELF | IN_MODIFY |
-        IN_MOVE_SELF | IN_MOVED_FROM | IN_MOVED_TO | IN_OPEN;
+        IN_MOVE_SELF | IN_MOVED_FROM | IN_MOVED_TO | IN_OPEN | IN_ONLYDIR;
 
-    for (const auto& directory : directories) {
-        const auto normalized_directory = directory.lexically_normal();
-        const int watch_descriptor = inotify_add_watch(
-            inotify_fd_, normalized_directory.c_str(), watch_mask);
-        if (watch_descriptor < 0) {
-            std::cerr << "Cannot watch directory " << normalized_directory << ": "
-                      << std::strerror(errno) << '\n';
-            stop();
+    if (directories.empty()) {
+        const std::string message = "No directories were provided to DirectoryMonitor";
+        std::cerr << message << '\n';
+        write_log("ERROR " + message);
+        cleanup_failed_start();
+        return false;
+    }
+
+    for (const auto& directory_value : directories) {
+        filesystem_error.clear();
+        const auto directory = fs::absolute(directory_value, filesystem_error).lexically_normal();
+        if (filesystem_error) {
+            const auto message = "Cannot resolve directory '" + directory_value.string() +
+                                 "': " + filesystem_error.message();
+            std::cerr << message << '\n';
+            write_log("ERROR " + message);
+            cleanup_failed_start();
             return false;
         }
-        watch_paths_[watch_descriptor] = normalized_directory;
+
+        filesystem_error.clear();
+        if (!fs::is_directory(directory, filesystem_error)) {
+            std::string message = "Cannot watch directory '" + directory.string() +
+                                  "': path does not exist or is not a directory";
+            if (filesystem_error) {
+                message += " (" + filesystem_error.message() + ")";
+            }
+            std::cerr << message << '\n';
+            write_log("ERROR " + message);
+            cleanup_failed_start();
+            return false;
+        }
+
+        const int watch_descriptor = inotify_add_watch(
+            inotify_fd_, directory.c_str(), watch_mask);
+        if (watch_descriptor < 0) {
+            const auto message = system_error_message(
+                "Cannot watch directory '" + directory.string() + "'");
+            std::cerr << message << '\n';
+            write_log("ERROR " + message);
+            cleanup_failed_start();
+            return false;
+        }
+
+        watch_paths_[watch_descriptor] = directory;
     }
 
     write_log("MONITOR_STARTED");
@@ -118,18 +169,28 @@ void DirectoryMonitor::process_events(int timeout_ms) {
         if (errno == EINTR) {
             return;
         }
-        const std::string message = "poll failed: " + std::string(std::strerror(errno));
+        const auto message = system_error_message("poll on inotify descriptor failed");
         std::cerr << message << '\n';
         write_log("ERROR " + message);
+        stop();
         return;
     }
     if (poll_result == 0) {
         return;
     }
-    if ((descriptor.revents & POLLIN) == 0) {
-        const std::string message = "poll returned unexpected event flags";
+
+    if ((descriptor.revents & (POLLERR | POLLHUP | POLLNVAL)) != 0) {
+        std::string flags;
+        if ((descriptor.revents & POLLERR) != 0) flags += " POLLERR";
+        if ((descriptor.revents & POLLHUP) != 0) flags += " POLLHUP";
+        if ((descriptor.revents & POLLNVAL) != 0) flags += " POLLNVAL";
+        const auto message = "Unexpected poll flags:" + flags;
         std::cerr << message << '\n';
         write_log("ERROR " + message);
+        stop();
+        return;
+    }
+    if ((descriptor.revents & POLLIN) == 0) {
         return;
     }
 
@@ -143,21 +204,31 @@ void DirectoryMonitor::process_events(int timeout_ms) {
             if (errno == EINTR) {
                 continue;
             }
-            const std::string message = "read failed: " + std::string(std::strerror(errno));
+            const auto message = system_error_message("read from inotify descriptor failed");
             std::cerr << message << '\n';
             write_log("ERROR " + message);
-            break;
+            stop();
+            return;
         }
         if (bytes_read == 0) {
             break;
         }
 
         const auto available = static_cast<std::size_t>(bytes_read);
-        std::size_t offset = 0;
-        while (offset + sizeof(inotify_event) <= available) {
+        std::size_t offset = 0U;
+        bool malformed_record = false;
+
+        while (offset < available) {
+            if (available - offset < sizeof(inotify_event)) {
+                malformed_record = true;
+                break;
+            }
+
             const auto* event = reinterpret_cast<const inotify_event*>(buffer.data() + offset);
-            const auto event_size = sizeof(inotify_event) + event->len;
-            if (offset + event_size > available) {
+            const auto header_size = sizeof(inotify_event);
+            const auto event_size = header_size + static_cast<std::size_t>(event->len);
+            if (event_size > available - offset) {
+                malformed_record = true;
                 break;
             }
 
@@ -177,12 +248,28 @@ void DirectoryMonitor::process_events(int timeout_ms) {
             }
             target = target.lexically_normal();
 
-            // Do not log writes to the log file itself if it is inside a watched directory.
-            if ((event->mask & IN_Q_OVERFLOW) != 0U || target != event_log_path_) {
+            if ((event->mask & IN_Q_OVERFLOW) != 0U) {
+                const std::string message =
+                    "INOTIFY_QUEUE_OVERFLOW: some filesystem events may have been lost";
+                std::cerr << message << '\n';
+                write_log("ERROR " + message);
+            } else if (target != event_log_path_) {
                 write_log(describe_event(event->mask) + " " + target.string());
             }
 
+            if ((event->mask & IN_IGNORED) != 0U) {
+                watch_paths_.erase(event->wd);
+            }
+
             offset += event_size;
+        }
+
+        if (malformed_record) {
+            const std::string message = "Malformed event record received from inotify";
+            std::cerr << message << '\n';
+            write_log("ERROR " + message);
+            stop();
+            return;
         }
     }
 }
@@ -203,7 +290,7 @@ void DirectoryMonitor::stop() noexcept {
 }
 
 void DirectoryMonitor::write_log(const std::string& message) {
-    if (!event_log_stream_) {
+    if (!event_log_stream_.is_open() || !event_log_stream_) {
         return;
     }
 
@@ -216,4 +303,9 @@ void DirectoryMonitor::write_log(const std::string& message) {
     }
     event_log_stream_ << message << '\n';
     event_log_stream_.flush();
+
+    if (!event_log_stream_) {
+        std::cerr << "Write error for event log '" << event_log_path_ << "'\n";
+        event_log_stream_.close();
+    }
 }
