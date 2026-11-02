@@ -372,31 +372,14 @@ for standard_fd in 0 1 2; do
 done
 pass "setsid(), chdir(/), and standard-stream redirection are applied"
 
-# A second process using the same PID-file path must fail before starting watches.
-"$BINARY" "$CONFIG_PATH" >"$TMP_ROOT/second-instance.log" 2>&1 &
-SECOND_PID=$!
-if ! wait_for_exit "$SECOND_PID" 2; then
-    kill -TERM "$SECOND_PID" 2>/dev/null || true
-    sleep 0.05
-    kill -KILL "$SECOND_PID" 2>/dev/null || true
-    wait "$SECOND_PID" 2>/dev/null || true
-    SECOND_PID=""
-    fail "second instance did not exit promptly; it may have bypassed the PID-file lock"
-fi
-set +e
-wait "$SECOND_PID"
-second_status=$?
-set -e
-SECOND_PID=""
-[[ "$second_status" -ne 0 ]] || fail "second instance unexpectedly started successfully"
-grep -Fq -- "locked by another running instance" "$TMP_ROOT/second-instance.log" || {
-    cat "$TMP_ROOT/second-instance.log" >&2
-    fail "second instance did not report the PID-file lock"
-}
-kill -0 "$PID" 2>/dev/null || fail "first instance exited after the second instance attempted to start"
-pid_after_second="$(tr -d '[:space:]' < "$PID_FILE")"
-[[ "$pid_after_second" == "$PID" ]] || fail "second instance changed the active PID file"
-pass "PID-file lock prevents a second instance from starting"
+# A second launch must gracefully replace the running daemon.
+old_pid="$PID"
+starts_before="$(count_fixed "$EVENT_LOG" "MONITOR_STARTED")"
+start_daemon "$starts_before"
+[[ "$PID" != "$old_pid" ]] || fail "replacement retained the old PID"
+wait_for_exit "$old_pid" 3 || fail "previous daemon did not stop"
+[[ "$(tr -d '[:space:]' < "$PID_FILE")" == "$PID" ]] || fail "replacement PID is missing"
+pass "second launch terminates the previous daemon and records the new daemon PID"
 
 # Exercise common file operations and check the expected inotify event classes.
 printf 'initial content\n' > "$WATCH_A/probe.txt"

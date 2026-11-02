@@ -2,12 +2,15 @@
 
 #include <algorithm>
 #include <cerrno>
+#include <chrono>
+#include <csignal>
 #include <climits>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <fcntl.h>
 #include <iostream>
+#include <thread>
 #include <sys/file.h>
 #include <sys/stat.h>
 #include <sys/syscall.h>
@@ -30,6 +33,58 @@ namespace {
     bool same_file(const struct stat &left, const struct stat &right) {
         return left.st_dev == right.st_dev && left.st_ino == right.st_ino && S_ISREG(left.st_mode)
                && S_ISREG(right.st_mode);
+    }
+
+    bool stop_previous_process(const std::filesystem::path &path, pid_t &last_signalled_pid) {
+        const int descriptor = open(path.c_str(), O_RDONLY | O_CLOEXEC | O_NOFOLLOW | O_NONBLOCK);
+        if (descriptor < 0) {
+            if (errno == ENOENT) {
+                return true;
+            }
+            report_error(error_message("Cannot read PID file '" + path.string() + "'", errno));
+            return false;
+        }
+        struct stat status {};
+        char contents[64] = {};
+        const ssize_t count = fstat(descriptor, &status) == 0 && S_ISREG(status.st_mode)
+                                  ? pread(descriptor, contents, sizeof(contents) - 1, 0) : -1;
+        close(descriptor);
+        if (count < 0) {
+            report_error("Cannot read regular PID file '" + path.string() + "'");
+            return false;
+        }
+        char *end = nullptr;
+        errno = 0;
+        const long value = std::strtol(contents, &end, 10);
+        while (*end == ' ' || *end == '\n' || *end == '\r' || *end == '\t') {
+            ++end;
+        }
+        if (errno != 0 || end == contents || *end != '\0'
+            || count == static_cast<ssize_t>(sizeof(contents) - 1) || value <= 1 || value > INT_MAX) {
+            return true; // An empty or malformed PID file contains no usable PID.
+        }
+        if (value == getpid()) {
+            report_error("PID file refers to the current process");
+            return false;
+        }
+        if (value == last_signalled_pid) {
+            return true;
+        }
+        const std::string proc_path = "/proc/" + std::to_string(value);
+        if (stat(proc_path.c_str(), &status) < 0) {
+            if (errno == ENOENT) {
+                return true;
+            }
+            report_error(error_message("Cannot inspect " + proc_path, errno));
+            return false;
+        }
+        if (kill(static_cast<pid_t>(value), SIGTERM) < 0 && errno != ESRCH) {
+            report_error(error_message("Cannot terminate PID " + std::to_string(value), errno));
+            return false;
+        }
+        syslog(LOG_INFO, "Sent SIGTERM to previous PID %ld", value);
+        last_signalled_pid = static_cast<pid_t>(value);
+        return true;
     }
 
     bool write_all(int descriptor, const void *data, std::size_t size) {
@@ -257,18 +312,29 @@ bool Daemon::prepare_pid_file(const std::string &path_string) {
         return false;
     }
 
-    int lock_result;
-    do {
-        lock_result = flock(lock_descriptor, LOCK_EX | LOCK_NB);
-    } while (lock_result < 0 && errno == EINTR);
-    if (lock_result < 0) {
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    pid_t last_signalled_pid = -1;
+    while (flock(lock_descriptor, LOCK_EX | LOCK_NB) < 0) {
         const int error_number = errno;
-        close(lock_descriptor);
-        if (error_number == EWOULDBLOCK || error_number == EAGAIN) {
-            report_error("PID file '" + path.string() + "' is locked by another running instance");
-        } else {
-            report_error(error_message("Cannot lock PID lock file '" + lock_path.string() + "'", error_number));
+        if (error_number == EINTR) {
+            continue;
         }
+        if (error_number != EWOULDBLOCK && error_number != EAGAIN) {
+            close(lock_descriptor);
+            report_error(error_message("Cannot lock PID lock file '" + lock_path.string() + "'", error_number));
+            return false;
+        }
+        if (std::chrono::steady_clock::now() >= deadline || !stop_previous_process(path, last_signalled_pid)) {
+            close(lock_descriptor);
+            report_error("Cannot acquire PID-file lock after waiting for the previous instance");
+            return false;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    }
+
+    // A PID may also have been recorded by an instance without the sidecar lock.
+    if (!stop_previous_process(path, last_signalled_pid)) {
+        close(lock_descriptor);
         return false;
     }
 
